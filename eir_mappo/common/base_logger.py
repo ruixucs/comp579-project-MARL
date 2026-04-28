@@ -71,5 +71,23 @@ class BaseLogger:
                 self.writter.add_scalar(
                     "env/" + k, np.mean(v), self.total_num_steps)
 
+    def log_attack_prob(self, adv_id, attack_prob, mean_return):
+        """Record step-level probabilistic attack evaluation result (COMP579 project).
+
+        adv_id: index of the adversarial agent
+        attack_prob: configured per-step attack probability (0.0~1.0)
+        mean_return: average evaluation return for this adv_id at this evaluation pass
+        """
+        line = (
+            f"[attack_prob] step={self.total_num_steps} adv_id={adv_id} "
+            f"attack_prob={float(attack_prob):.3f} mean_return={float(mean_return):.4f}\n"
+        )
+        self.log_file.write(line)
+        self.log_file.flush()
+        if self.writter is not None:
+            tag_prefix = f"attack_prob/agent{adv_id}"
+            self.writter.add_scalar(f"{tag_prefix}/attack_prob", float(attack_prob), self.total_num_steps)
+            self.writter.add_scalar(f"{tag_prefix}/mean_return", float(mean_return), self.total_num_steps)
+
     def close(self):
         self.log_file.close()

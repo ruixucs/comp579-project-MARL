@@ -55,6 +55,10 @@ class OnPolicyMARunnerAdvtBelief:
         self.fixed_order = algo_args["algo"].get("fixed_order", False)
         # adv training
         self.adv_prob = algo_args["algo"].get("adv_prob", 0.5)  # probability of having adversary
+        # COMP579 project: step-level probability that the (already-fixed) adversary attacks per timestep.
+        # 1.0 reproduces legacy behavior; 0.2/0.5/0.8 = intermittent attack experiment.
+        self.attack_prob = algo_args["algo"].get("attack_prob", 1.0)
+        assert 0.0 <= self.attack_prob <= 1.0, f"attack_prob must be in [0,1], got {self.attack_prob}"
         self.eval_critic_landscape = algo_args["algo"].get("eval_critic_landscape", False)  # probability of having adversary
         # adding adversary on observation
         self.obs_adversary = env_args.get("obs_agent_adversary", True)
@@ -230,7 +234,12 @@ class OnPolicyMARunnerAdvtBelief:
                 values, actions, adv_actions, action_log_probs, adv_action_log_probs, rnn_states, \
                     adv_rnn_states, belief_rnn_states, rnn_states_critic = self.collect_adv(step)
                 input_actions = actions.copy()
-                input_actions[self.episode_adversary, self.agent_adversary] = adv_actions[self.episode_adversary, self.agent_adversary]
+                # COMP579: step-level probabilistic attack. The adversary's identity is determined
+                # per-episode by `episode_adversary`; on top of that, the adversary actually fires
+                # at this step with probability `attack_prob`. attack_prob=1.0 is legacy behavior.
+                step_attack = (np.random.rand(self.n_rollout_threads) < self.attack_prob)
+                attack_mask = self.episode_adversary & step_attack
+                input_actions[attack_mask, self.agent_adversary] = adv_actions[attack_mask, self.agent_adversary]
                 # actions: (n_threads, n_agents, action_dim)
                 obs, share_obs, rewards, dones, infos, available_actions = self.envs.step(input_actions)
                 # obs: (n_threads, n_agents, obs_dim)
@@ -944,7 +953,11 @@ class OnPolicyMARunnerAdvtBelief:
 
             eval_actions = np.array(eval_actions_collector).transpose(1, 0, 2)
             eval_adv_actions = np.array(eval_adv_actions_collector).transpose(1, 0, 2)
-            eval_actions[:, adv_id] = eval_adv_actions[:, adv_id]
+            # COMP579: step-level probabilistic attack at eval. adv_id is fixed; whether it fires
+            # this step is sampled per-thread with `attack_prob`.
+            n_eval_threads = eval_actions.shape[0]
+            step_attack = (np.random.rand(n_eval_threads) < self.attack_prob)
+            eval_actions[step_attack, adv_id] = eval_adv_actions[step_attack, adv_id]
 
             # Obser reward and next obs
             eval_obs, eval_share_obs, eval_rewards, eval_dones, eval_infos, eval_available_actions = self.eval_envs.step(
@@ -982,6 +995,9 @@ class OnPolicyMARunnerAdvtBelief:
             if eval_episode >= self.algo_args["eval"]["eval_episodes"]:
                 # eval_log returns whether the current model should be saved
                 ret_mean = self.logger.eval_log_adv(eval_episode, adv_id)
+                # COMP579: record (attack_prob, return) tuple for downstream aggregation.
+                if hasattr(self.logger, "log_attack_prob"):
+                    self.logger.log_attack_prob(adv_id, self.attack_prob, ret_mean)
                 break
 
         self.adapt_adv_probs[adv_id] = np.mean(self.logger.eval_episode_rewards)

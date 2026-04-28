@@ -74,6 +74,8 @@ algo:
   action_aggregation: prod # choose from prod, mean
   # adv training
   adv_prob: 1 # fixed
+  # step-level: probability that the adversary actually attacks at each timestep.
+  attack_prob: 1.0
   agent_adversary: 0
   victim_interval: 1
   adv_entropy_coef: 0.01

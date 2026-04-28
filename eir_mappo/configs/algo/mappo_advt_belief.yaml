@@ -71,6 +71,9 @@ algo:
   action_aggregation: prod # choose from prod, mean
   # adv training
   adv_prob: 0.5
+  # step-level: probability that the (already-determined) adversary actually attacks at each timestep.
+  # 1.0 = always attack (legacy behavior); 0.2/0.5/0.8 = intermittent attacks for the COMP579 experiment.
+  attack_prob: 1.0
   agent_adversary: -1
   victim_interval: 1
   adv_entropy_coef: 0.01
