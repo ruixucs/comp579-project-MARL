@@ -1,94 +1,151 @@
-# **Byzantine Robust Cooperative Multi-Agent Reinforcement Learning as a Bayesian Game**
+# COMP579 Project — Probabilistic Adversary in Cooperative MARL
 
-This repository is the official implementation of the paper accepted by ICLR 2024: Byzantine Robust Cooperative Multi-Agent Reinforcement Learning as a Bayesian Game. It contains the implementation of the EIR-MAPPO defense method, along with several Multi-Agent Reinforcement Learning (MARL) environments used for evaluating our results, such as Toy, LBF, and SMAC.
+This repository extends [EIR-MAPPO](https://github.com/DIG-Beihang/EIR-MAPPO) (ICLR 2024:
+*Byzantine Robust Cooperative Multi-Agent Reinforcement Learning as a Bayesian Game*)
+with a **step-level probabilistic adversary** for the COMP579 course project.
 
-This repository is based on [PKU-MARL/HARL](https://github.com/PKU-MARL/HARL).
+## TL;DR
 
-## How to Run This Code
+Original EIR-MAPPO models adversaries with a **per-episode** probability `adv_prob`:
+either an agent is the adversary for the entire episode, or it is not. We add a
+**per-step** probability `attack_prob`: the adversary's *identity* is fixed (or
+sampled per episode as before), but at every timestep it independently decides
+whether to actually fire the adversarial action with probability `attack_prob`.
 
-### Environment Setup
+The COMP579 experiment trains a defender at three step-level attack rates and
+compares robustness:
 
-The process of environment setup is the same as in [PKU-MARL/HARL](https://github.com/PKU-MARL/HARL). For details, please refer to the README file in that repository.
+| Setting | `attack_prob` | Behavior |
+|---------|---------------|----------|
+| Sparse  | 0.2 | Adversary attacks only ~20% of steps; very stealthy. |
+| Medium  | 0.5 | Coin-flip every step. |
+| Aggressive | 0.8 | Attacks ~80% of steps; close to legacy `attack_prob=1.0`. |
 
-### Choose the Training algorithm and Environment
+Each setting × 3 seeds = 9 training runs, then we aggregate evaluation return
+into a single `attack_prob` vs return curve.
 
-Our codebase supports various algorithms and environments, with default parameters specified in `./eir_mappo/configs`. The training algorithm parameters for EIR-MAPPO are located in `./eir_mappo/configs/alg/mappo_advt_belief.yaml`, and parameters for the attacking algorithm are in `./eir_mappo/configs/alg/mappo_traitor_belief.yaml`.
+## What changed vs. upstream EIR-MAPPO
 
-Environment-specific parameters are stored in `./eir_mappo/configs/env`, with the YAML configuration files listed as follows:
+| File | Change |
+|------|--------|
+| [`eir_mappo/configs/algo/mappo_advt_belief.yaml`](eir_mappo/configs/algo/mappo_advt_belief.yaml) | New key `attack_prob: 1.0` (default = legacy behavior). |
+| [`eir_mappo/configs/algo/mappo_traitor_belief.yaml`](eir_mappo/configs/algo/mappo_traitor_belief.yaml) | New key `attack_prob: 1.0`. |
+| [`eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py) | (a) `__init__` reads `attack_prob` and asserts it ∈ [0,1]; (b) training rollout combines `episode_adversary` with a per-step `step_attack` mask; (c) `_eval_adv` does the same per-step masking and calls a new logger hook. |
+| [`eir_mappo/common/base_logger.py`](eir_mappo/common/base_logger.py) | New method `log_attack_prob(adv_id, attack_prob, mean_return)` writes a `[attack_prob] ...` line to `progress.txt` and adds TensorBoard scalars. |
+| [`scripts/run_attack_prob_training.sh`](scripts/run_attack_prob_training.sh) | New: batch trainer for `{0.2, 0.5, 0.8} × {seed1,2,3}`. |
+| [`scripts/aggregate_attack_prob_results.py`](scripts/aggregate_attack_prob_results.py) | New: walks `eir_mappo/results/.../attack_prob_*/`, reads `config.json` + TensorBoard events, emits CSV + matplotlib curve. |
+| [`tests/test_attack_prob_logic.py`](tests/test_attack_prob_logic.py) | New: pure-numpy unit tests of the mask math. |
+| [`docs/experiment-instructions.md`](docs/experiment-instructions.md) | Step-by-step run instructions. |
+| `README_EIR_MAPPO.md` | The original EIR-MAPPO README is preserved verbatim. |
 
-| MARL Environment | YAML Configuration File                |
-| ---------------- | -------------------------------------- |
-| Toy              | `./eir_mappo/configs/env/toy.yaml`          |
-| LBF              | `./eir_mappo/configs/env/lbforaging.yaml`   |
-| SMAC (Training)  | `./eir_mappo/configs/env/smac.yaml`         |
-| SMAC (Attack)    | `./eir_mappo/configs/env/smac_traitor.yaml` |
+### Mask math
 
-### Training the Agents and Saving the models
+The runner combines the existing per-episode mask with the new per-step mask:
 
-To train the agents, execute the following command as an example:
+```python
+# In runner.run() training rollout (each step, n_threads independent samples):
+step_attack = (np.random.rand(self.n_rollout_threads) < self.attack_prob)
+attack_mask = self.episode_adversary & step_attack
+input_actions[attack_mask, self.agent_adversary] = adv_actions[attack_mask, self.agent_adversary]
 
-```bash
-python -u main.py --alg mappo_advt_belief --env smac --exp_name train --map_name 4m_vs_3m --seed 1
+# In runner._eval_adv() per evaluation step:
+step_attack = (np.random.rand(n_eval_threads) < self.attack_prob)
+eval_actions[step_attack, adv_id] = eval_adv_actions[step_attack, adv_id]
 ```
 
-* `--alg`: Sets the algorithm. Using `--alg mappo_advt_belief` indicates the use of the training algorithm EIR-MAPPO, with default parameters stored in `./eir_mappo/configs/alg/mappo_advt_belief.yaml`.
-* `--env`: Sets the MARL environment. Specifying `--env smac` selects the SMAC environment for training, with its default parameters located in `./eir_mappo/configs/env/smac.yaml`.
-* `--map_name`: Specifies the map to be used for training. If `--map` is not explicitly set, the default map name specified in the environment's configuration file is used. The `map_name` parameter is ignored when the selected environment is `Toy`.
-* `--exp_name`:  Names the experiment. If `--exp_name` is not provided, it defaults to `test`.
-* `--seed`:  Specifies the seed for initializing the experiment, with its default set in the algorithm's configuration file.
+`attack_prob = 1.0` exactly reproduces upstream behavior, so all original
+EIR-MAPPO experiments still work unchanged.
 
-The models and training data are saved in the the following directories:
+## How to run
 
-```bash
-# For MARL environments other than Toy
-models: ./eir_mappo/results/{env}/{map_name}/mappo_advt_belief/{exp_name}/{seed}/run{iter}/models
-data: ./eir_mappo/results/{env}/{map_name}/mappo_advt_belief/{exp_name}/{seed}/run{iter}/logs
+> Setup: follow upstream env setup (PyTorch, SC2, etc.) per
+> [README_EIR_MAPPO.md](README_EIR_MAPPO.md) and the parent
+> [HARL repo](https://github.com/PKU-MARL/HARL). The new code adds **no new
+> Python deps beyond NumPy + TensorBoard + matplotlib**.
 
-# For the Toy MARL environment
-models: ./eir_mappo/results/{env}/mappo_advt_belief/{exp_name}/{seed}/run{iter}/models
-data: ./eir_mappo/results/{env}/mappo_advt_belief/{exp_name}/{seed}/run{iter}/logs
-```
+### 1) (Optional) Pretrain a victim defender
 
-The `{iter}` placeholder in the path is incremented by one with each new run, ensuring that experimental data for the same configuration do not overlap, starting with an initial value of 1.
-
-### Attacking the Models and Saving the Adversarial Policy
-
-To attack the models and train the adversarial agents, execute the following command as an example:
+If you don't already have an `mappo_advt_belief` checkpoint:
 
 ```bash
-python -u main.py --alg mappo_traitor_belief --env smac --exp_name attack_eir_mappo --map_name 4m_vs_3m --seed 1 --agent_adversary 0 --model_dir ./eir_mappo/results/smac/4m_vs_3m/mappo_advt_belief/eir_mappo/1/run1/models 
+python -u train.py --alg mappo_advt_belief --env smac \
+  --map_name 4m_vs_3m --exp_name baseline --seed 1
 ```
 
-* `--alg --env --exp_name --map_name --seed`: Parameters are as previously described.
-* `--model_dir`: Specifies the directory containing the model to be attacked.
-* `--agent_adversary`: Indicates the index of the adversarial agent within the training environment.
-
-The adversarial agent's index can be configured in the algorithm's configuration file (`./eir_mappo/configs/alg/mappo_traitor_belief.yaml`).
-
-The models and attack data are saved in the following directories:
+### 2) Run the COMP579 batch experiment
 
 ```bash
-# For MARL environments other than Toy
-models: ./eir_mappo/results/{env}/{map_name}/mappo_traitor_belief/{exp_name}/{seed}/run{iter}/models
-datas: ./eir_mappo/results/{env}/{map_name}/mappo_traitor_belief/{exp_name}/{seed}/run{iter}/logs
-
-# For MARL environments other than Toy
-models: ./eir_mappo/results/{env}/mappo_traitor_belief/{exp_name}/{seed}/run{iter}/models
-datas: ./eir_mappo/results/{env}/mappo_traitor_belief/{exp_name}/{seed}/run{iter}/logs
+bash scripts/run_attack_prob_training.sh smac 4m_vs_3m 5000000
 ```
 
-* `{env}, {map_name}, {exp_name}, {seed}, {iter}`: These placeholders are as previously described.
+This trains 9 models — 3 attack probabilities × 3 seeds — under
+`eir_mappo/results/smac/4m_vs_3m/mappo_advt_belief/attack_prob_{0.2,0.5,0.8}/{1,2,3}/run1/`.
 
-## Demo Videos
+For toy:
 
-We evaluate our performance under the most arduous non-oblivious attack, where an adversary can manipulate any agent in cooperative tasks and execute an arbitrary learned worst-case policy. We also record the behaviors of the agents under the attack in the videos. These videos showcase our methods alongside the baseline methods in the *12x12-4p-3f-c* configuration of the LBF environment and the *4m vs 3m* scenario of the SMAC MARL environment, as illustrated in the table below.
+```bash
+bash scripts/run_attack_prob_training.sh toy '' 2000000
+```
 
-| Training algorithm | Video Directory                                              |
-| ------------------ | ------------------------------------------------------------ |
-| MADDPG             | [LBF video](./video/LBF/MADDPG.m4v) [SMAC video](./video/SMAC/MADDPG.m4v) |
-| M3DDPG             | [LBF video](./video/LBF/M3DDPG.m4v) [SMAC video](./video/SMAC/M3DDPG.m4v) |
-| MAPPO              | [LBF video](./video/LBF/MAPPO.m4v) [SMAC video](./video/SMAC/MAPPO.m4v) |
-| RMAAC              | [LBF video](./video/LBF/RMAAC.m4v) [SMAC video](./video/SMAC/RMAAC.m4v) |
-| EAR-MAPPO          | [LBF video](./video/LBF/EAR-MAPPO.m4v) [SMAC video](./video/SMAC/EAR-MAPPO.m4v) |
-| EIR-MAPPO          | [LBF video](./video/LBF/EIR-MAPPO.m4v) [SMAC video](./video/SMAC/EIR-MAPPO.m4v) |
-| True Type          | [LBF video](./video/LBF/True-Type.m4v) [SMAC video](./video/SMAC/True-Type.m4v) |
+For LBF:
+
+```bash
+bash scripts/run_attack_prob_training.sh lbforaging '' 5000000
+```
+
+### 3) Aggregate results
+
+```bash
+python scripts/aggregate_attack_prob_results.py \
+  --env smac --map 4m_vs_3m --out-dir analysis/attack_prob_smac
+```
+
+Outputs:
+- `analysis/attack_prob_smac/attack_prob_summary.csv` — one row per run
+- `analysis/attack_prob_smac/attack_prob_curve.png` — mean ± std return vs `attack_prob`
+
+If the script reports "none of the candidate tags matched", inspect
+TensorBoard tags via the diagnostic command it prints, then rerun with
+`--tag <correct_tag>`.
+
+### 4) Sanity-check the mask logic
+
+```bash
+pytest tests/test_attack_prob_logic.py -v
+```
+
+Should report 8 tests passing. No GPU / RL env required.
+
+## Design notes
+
+- **Identity vs behavior.** Upstream `adv_prob` controls **who is adversary**
+  per episode; new `attack_prob` controls **whether the adversary actually
+  attacks** at each step. They are orthogonal. Setting `adv_prob=1` and
+  `attack_prob=p` gives "always-present, intermittently-attacking adversary",
+  which matches the COMP579 threat model (adversary present but stealthy).
+- **Belief network.** `ground_truth_type` is unchanged: belief is still trained
+  to label the adversary's identity correctly. With `attack_prob<1`, the belief
+  signal is sparser (the adversary is "betraying" only some steps), so this
+  experiment tests how well the Bayesian-game belief module generalizes under
+  intermittent betrayal.
+- **Reproducibility.** `save_config` already serializes the active
+  `algo_args` to `run_dir/config.json`, including `attack_prob`. The
+  aggregation script reads `config.json` as the source of truth for each run's
+  configured probability, never trusting the directory name alone.
+
+## Citation
+
+If you use this code, please cite the original EIR-MAPPO paper:
+
+```
+@inproceedings{yuan2024byzantine,
+  title={Byzantine Robust Cooperative Multi-Agent Reinforcement Learning as a Bayesian Game},
+  author={Yuan, Yi and Zhang, Yunbo and ...},
+  booktitle={ICLR},
+  year={2024}
+}
+```
+
+## License
+
+Inherits the upstream EIR-MAPPO license.
