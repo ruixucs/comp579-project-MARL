@@ -13,10 +13,22 @@ class ActorBufferAdvtBelief(ActorBufferAdvt):
         self.ground_truth_type = np.zeros((self.episode_length + 1, self.n_rollout_threads, self.num_agents), dtype=np.float32)
         self.belief_rnn_states = np.zeros((self.episode_length + 1, self.n_rollout_threads,
                                    self.recurrent_N, self.rnn_hidden_size), dtype=np.float32)
+        # COMP579 sec 5.7: zeta_t (step-level Bernoulli attack indicator). Shape matches
+        # `actions` rather than `obs`, i.e. one entry per (step, thread). Stored as float32
+        # so it can be multiplied directly into the BCE loss tensor.
+        self.step_attack = np.zeros((self.episode_length, self.n_rollout_threads, 1), dtype=np.float32)
 
-    def insert(self, obs, ground_truth_type, rnn_states, adv_rnn_states, belief_rnn_states, actions, adv_actions, action_log_probs, adv_action_log_probs, rewards, masks, active_masks=None, adv_active_masks=None, available_actions=None):
+    def insert(self, obs, ground_truth_type, rnn_states, adv_rnn_states, belief_rnn_states, actions, adv_actions, action_log_probs, adv_action_log_probs, rewards, masks, active_masks=None, adv_active_masks=None, available_actions=None, step_attack=None):
         self.ground_truth_type[self.step + 1] = ground_truth_type.copy()
         self.belief_rnn_states[self.step + 1] = belief_rnn_states.copy()
+        if step_attack is not None:
+            # `step_attack` arrives as a (n_threads,) bool array; we store it as
+            # (n_threads, 1) float so it matches the per-step layout of `actions`.
+            self.step_attack[self.step] = np.asarray(step_attack, dtype=np.float32).reshape(-1, 1)
+        else:
+            # Legacy path (no step-level mask provided): assume the adversary always fires,
+            # which keeps backward compatibility with attack_prob = 1.0.
+            self.step_attack[self.step] = 1.0
         super().insert(obs, rnn_states, adv_rnn_states, actions, adv_actions, action_log_probs, adv_action_log_probs, rewards, masks, active_masks, adv_active_masks, available_actions)
 
     def after_update(self):
@@ -56,6 +68,9 @@ class ActorBufferAdvtBelief(ActorBufferAdvt):
         masks = _sa_cast(self.masks[:-1])
         active_masks = _sa_cast(self.active_masks[:-1])
         adv_active_masks = _sa_cast(self.adv_active_masks[:-1])
+        # COMP579: step-level attack indicator (zeta_t). Same shape conventions as the
+        # other (T, N, 1) tensors above, so _sa_cast applies the same flattening.
+        step_attack = _sa_cast(self.step_attack)
         if self.factor is not None:
             factor = _sa_cast(self.factor)
         rnn_states = self.rnn_states[:-1].transpose(
@@ -85,6 +100,7 @@ class ActorBufferAdvtBelief(ActorBufferAdvt):
             old_adv_action_log_probs_batch = []
             adv_targ = []
             factor_batch = []
+            step_attack_batch = []
             for index in indices:
                 ind = index * data_chunk_length
                 # size [T+1 N M Dim]-->[T N Dim]-->[N T Dim]-->[T*N,Dim]-->[L,Dim]
@@ -106,6 +122,7 @@ class ActorBufferAdvtBelief(ActorBufferAdvt):
                 old_adv_action_log_probs_batch.append(
                     adv_action_log_probs[ind:ind+data_chunk_length])
                 adv_targ.append(advantages[ind:ind+data_chunk_length])
+                step_attack_batch.append(step_attack[ind:ind+data_chunk_length])
                 # size [T+1 N Dim]-->[T N Dim]-->[T*N,Dim]-->[1,Dim]
                 rnn_states_batch.append(rnn_states[ind])
                 adv_rnn_states_batch.append(adv_rnn_states[ind])
@@ -131,6 +148,7 @@ class ActorBufferAdvtBelief(ActorBufferAdvt):
             old_action_log_probs_batch = np.stack(old_action_log_probs_batch, axis=1)
             old_adv_action_log_probs_batch = np.stack(old_adv_action_log_probs_batch, axis=1)
             adv_targ = np.stack(adv_targ, axis=1)
+            step_attack_batch = np.stack(step_attack_batch, axis=1)
 
             # States is just a (N, -1) from_numpy
             rnn_states_batch = np.stack(rnn_states_batch).reshape(
@@ -158,12 +176,13 @@ class ActorBufferAdvtBelief(ActorBufferAdvt):
             old_action_log_probs_batch = _flatten(L, N, old_action_log_probs_batch)
             old_adv_action_log_probs_batch = _flatten(L, N, old_adv_action_log_probs_batch)
             adv_targ = _flatten(L, N, adv_targ)
+            step_attack_batch = _flatten(L, N, step_attack_batch)
             if self.factor is not None:
                 yield obs_batch, obs_next_batch, ground_truth_type_batch, rnn_states_batch, adv_rnn_states_batch, belief_rnn_states_batch, actions_batch, adv_actions_batch,\
                     masks_batch, active_masks_batch, adv_active_masks_batch, old_action_log_probs_batch, old_adv_action_log_probs_batch,\
-                    adv_targ, available_actions_batch, factor_batch
+                    adv_targ, available_actions_batch, factor_batch, step_attack_batch
             else:
                 yield obs_batch, obs_next_batch, ground_truth_type_batch, rnn_states_batch, adv_rnn_states_batch, belief_rnn_states_batch, actions_batch, adv_actions_batch,\
                     masks_batch, active_masks_batch, adv_active_masks_batch, old_action_log_probs_batch, old_adv_action_log_probs_batch,\
-                    adv_targ, available_actions_batch
+                    adv_targ, available_actions_batch, step_attack_batch
     

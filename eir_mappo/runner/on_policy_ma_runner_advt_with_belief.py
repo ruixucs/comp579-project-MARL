@@ -248,9 +248,12 @@ class OnPolicyMARunnerAdvtBelief:
                 # dones: (n_threads, n_agents)
                 # infos: (n_threads)
                 # available_actions: (n_threads, ) of None or (n_threads, n_agents, action_number)
+                # COMP579: step_attack (zeta_t in eq.5.3) is forwarded to insert() so that the
+                # buffer can record it and (a) mask the adversary's PPO advantage on non-fired
+                # steps (sec 5.6), (b) mask the belief BCE loss on uninformative steps (sec 5.7).
                 data = obs, share_obs, rewards, dones, infos, self.ground_truth_type, available_actions, \
                     values, actions, adv_actions, action_log_probs, adv_action_log_probs, \
-                    rnn_states, adv_rnn_states, belief_rnn_states, rnn_states_critic
+                    rnn_states, adv_rnn_states, belief_rnn_states, rnn_states_critic, step_attack
 
                 self.logger.per_step(data)
 
@@ -437,7 +440,7 @@ class OnPolicyMARunnerAdvtBelief:
     def insert(self, data):
         obs, share_obs, rewards, dones, infos, ground_truth_type, available_actions, \
                     values, actions, adv_actions, action_log_probs, adv_action_log_probs, \
-                    rnn_states, adv_rnn_states, belief_rnn_states, rnn_states_critic = data
+                    rnn_states, adv_rnn_states, belief_rnn_states, rnn_states_critic, step_attack = data
 
         dones_env = np.all(dones, axis=1)
 
@@ -472,6 +475,11 @@ class OnPolicyMARunnerAdvtBelief:
         active_masks[self.episode_adversary, self.agent_adversary] = 0
         adv_active_masks[~self.episode_adversary] = 0
         adv_active_masks[:, np.arange(self.num_agents)!=self.agent_adversary] = 0
+        # COMP579 sec 5.6: zero out adversary's PPO active mask on non-fired steps.
+        # On steps where step_attack=False the env executed the actor's normal action, not
+        # the adversary's; including those steps in the adversary's PPO objective would
+        # violate the on-policy assumption (the realized action is not from \hat{\pi}).
+        adv_active_masks[~step_attack] = 0
 
         # bad_masks use 0 to denote truncation and 1 to denote termination
         if self.state_type == "EP":
@@ -483,7 +491,8 @@ class OnPolicyMARunnerAdvtBelief:
         for agent_id in range(self.num_agents):
             self.actor_buffer[agent_id].insert(obs[:, agent_id], ground_truth_type[:, agent_id], rnn_states[:, agent_id], adv_rnn_states[:, agent_id], belief_rnn_states[:, agent_id], actions[:, agent_id], adv_actions[:, agent_id],
                                                action_log_probs[:, agent_id], adv_action_log_probs[:, agent_id], rewards[:, agent_id], masks[:, agent_id], active_masks[:, agent_id],
-                                               adv_active_masks[:, agent_id], available_actions[:, agent_id] if available_actions[0] is not None else None)
+                                               adv_active_masks[:, agent_id], available_actions[:, agent_id] if available_actions[0] is not None else None,
+                                               step_attack=step_attack)
 
         if self.state_type == "EP":
             self.critic_buffer.insert(share_obs, rnn_states_critic, values, rewards, masks, bad_masks)

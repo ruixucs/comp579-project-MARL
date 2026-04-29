@@ -26,7 +26,9 @@ most of the time and strikes selectively.
 |------|--------|
 | [`eir_mappo/configs/algo/mappo_advt_belief.yaml`](eir_mappo/configs/algo/mappo_advt_belief.yaml) | New key `attack_prob: 1.0` (default = legacy behavior). |
 | [`eir_mappo/configs/algo/mappo_traitor_belief.yaml`](eir_mappo/configs/algo/mappo_traitor_belief.yaml) | New key `attack_prob: 1.0`. |
-| [`eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py) | (a) `__init__` reads `attack_prob` and asserts it ∈ [0,1]; (b) training rollout combines `episode_adversary` with a per-step `step_attack` mask; (c) `_eval_adv` applies the same per-step masking and calls a new logger hook. |
+| [`eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py) | (a) `__init__` reads `attack_prob` and asserts it ∈ [0,1]; (b) training rollout combines `episode_adversary` with a per-step `step_attack` mask; (c) `insert()` applies the §5.6 mask `adv_active_masks[~step_attack]=0` so the adversary's PPO is on-policy; (d) `step_attack` is forwarded to the buffer for use in the §5.7 belief loss; (e) `_eval_adv` applies the same per-step masking and calls a new logger hook. |
+| [`eir_mappo/common/actor_buffer_advt_with_belief.py`](eir_mappo/common/actor_buffer_advt_with_belief.py) | Stores per-step `step_attack` (`(episode_length, n_rollout_threads, 1)`); `recurrent_generator_belief` returns it as the 16th batch field. |
+| [`eir_mappo/algo/mappo_advt_with_belief.py`](eir_mappo/algo/mappo_advt_with_belief.py) | §5.7: belief BCE loss is multiplied elementwise by `step_attack_batch` and renormalized (`step_attack_batch.sum() * num_agents`) so non-fired steps stop contributing supervision. The denominator is chosen so `attack_prob = 1.0` is bit-equivalent to upstream `loss.mean()`. |
 | [`eir_mappo/common/base_logger.py`](eir_mappo/common/base_logger.py) | New method `log_attack_prob(adv_id, attack_prob, mean_return)` writes `[attack_prob] ...` lines to `progress.txt` and adds TensorBoard scalars. |
 | [`scripts/run_attack_prob_training.sh`](scripts/run_attack_prob_training.sh) | Batch trainer for `{0.2, 0.5, 0.8} × {seed1,2,3}`. |
 | [`scripts/aggregate_attack_prob_results.py`](scripts/aggregate_attack_prob_results.py) | Walks `eir_mappo/results/.../attack_prob_*/`, reads `config.json` + TensorBoard events, emits CSV + matplotlib curve. |
@@ -124,13 +126,13 @@ Should report 8 tests passing.
 
 ---
 
-## 3. Critical self-review — three known limitations
+## 3. Critical self-review — limitations
 
-After implementing the change above, I went back and reviewed my own diff. The result is
-not as harmless as it looks. Three issues will make any results harder to interpret unless
-they are addressed. Listed by severity.
+After implementing the per-step override I reviewed my own diff and found three issues
+that would have made results hard to interpret. **A and B are now fixed in code; C
+remains a limitation acknowledged in this section.**
 
-### 3.1 Limitation A — belief network's supervision signal gets corrupted
+### 3.1 Limitation A — belief network's supervision signal gets corrupted (FIXED)
 
 EIR-MAPPO's core mechanism is the **belief network**: it has to figure out *which teammate
 is the adversary* from observed behavior, trained as a supervised classifier whose label
@@ -153,11 +155,15 @@ is **not necessarily evidence that intermittent attacks are harder to defend aga
 might just be evidence that the belief network's training data is broken. These two
 interpretations are radically different research-wise.
 
-**Fix sketch (≈10 lines)**: only compute belief loss on steps where `step_attack = True`.
-Optionally enrich the belief input with the critic's per-agent advantage as a denser
-signal to compensate for sparser supervision.
+**Status: fixed.** See §5.7 derivation and the implemented mask in
+[`mappo_advt_with_belief.update_belief`](eir_mappo/algo/mappo_advt_with_belief.py): the
+BCE loss is now multiplied elementwise by `step_attack_batch` and renormalized by
+`step_attack_batch.sum() * num_agents`, so non-fired steps no longer enter the
+supervised signal. The denominator is chosen so that `attack_prob = 1.0` recovers
+`loss.mean()` bit-equivalently. Belief inputs are unchanged; the optional advantage
+enrichment was deferred as a future direction.
 
-### 3.2 Limitation B — adversary's training objective is misaligned
+### 3.2 Limitation B — adversary's training objective is misaligned (FIXED)
 
 The adversary is trained with PPO to maximize damage to the team. The problem:
 
@@ -180,12 +186,15 @@ distinguish "I attacked successfully" from "I didn't attack but got credited for
 actor's action". The optimal policy degenerates to "output the action that's worst on
 average across all states" instead of "pick the right state to strike at".
 
-**Fix sketch (1 line)**: in the adversary's PPO loss, mask out the non-fired steps:
-`adv_active_masks[~step_attack] = 0`. This is half-correct: it stops the false credit
-assignment, but the adversary still cannot proactively learn *when* to attack (that would
-need a hierarchical adversary with its own attack/no-attack head).
+**Status: fixed (partial).** Implemented in
+[`runner.insert()`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py) as
+`adv_active_masks[~step_attack] = 0` (see §5.6). This stops the false credit
+assignment so PPO is on-policy with respect to the realized actions. It does **not**
+let the adversary proactively learn *when* to attack — that would require a
+hierarchical adversary with its own attack/no-attack head, which is out of scope for
+this fork.
 
-### 3.3 Limitation C — train and eval probabilities are coupled
+### 3.3 Limitation C — train and eval probabilities are coupled (NOT FIXED)
 
 My 9 runs all use `attack_prob_train == attack_prob_eval` — each model is only ever
 evaluated at the same attack rate it was trained at.
@@ -216,25 +225,25 @@ of a 3-point diagonal.
 ### 3.4 How the three interact
 
 ```
-A (belief noise) ────────► defender decisions degrade ─┐
-                                                       │
-B (adversary misaligned) ► attack difficulty understated ─┼──► eval return becomes hard to interpret;
-                                                       │       A and B confound any apparent C result
-C (train=eval coupled) ──► no robustness curve visible ─┘
+A (belief noise, FIXED) ─────► defender decisions are now trained on informative steps only
+B (adversary misaligned, FIXED) ► PPO is on-policy w.r.t. realized actions
+C (train=eval coupled, OPEN) ─► no robustness curve visible — measures task difficulty,
+                                  not generalization across attack rates
 ```
 
-Fixing C alone gives a clean robustness matrix, but every cell is still polluted by A and
-B. Fixing A or B alone improves one piece of the pipeline but the experiment still measures
-"task difficulty", not robustness. The three need to be addressed together (or at least in
-the order C → A → B) for results to support a defensible claim.
+With A and B addressed, each cell of the resulting *return-vs-attack-prob* curve is
+internally consistent. The remaining caveat is exactly C: each cell still uses
+`attack_prob_train == attack_prob_eval`, so the curve still measures task difficulty
+under a matched attacker, not robustness to *unseen* attack rates. A cross-evaluation
+matrix would be the cleanest way to disentangle these; that work is left to a follow-up.
 
-### 3.5 Priority
+### 3.5 Priority and status
 
-| | Fix | Cost | Why first/next/last |
-|--|------|------|---------------------|
-| 1 | **C** — split train/eval `attack_prob`, add cross-eval script | ~30 lines | Pure infrastructure; doesn't touch the algorithm; necessary for any subsequent fix to be measurable. |
-| 2 | **A** — belief loss only on fired steps (+ optional advantage input) | ~10 lines | Restores supervised-signal validity. Required for the cross-eval matrix to mean anything. |
-| 3 | **B** — PPO mask on non-fired steps for adversary | 1 line | Theoretical clean-up. Improves adversary quality but improvements only show up clearly once A and C are in place. |
+| | Fix | Cost | Status |
+|--|------|------|--------|
+| 1 | **A** — belief BCE loss only on fired steps | ~50 lines (buffer plumbing + algo) | **Done** — see §5.7 / `update_belief` |
+| 2 | **B** — PPO active-mask on non-fired steps for adversary | 1 line | **Done** — see §5.6 / `runner.insert` |
+| 3 | **C** — split `attack_prob_train` / `attack_prob_eval`, add cross-eval script | ~30 lines | **Open** — acknowledged limitation |
 
 ---
 
@@ -376,21 +385,18 @@ $\hat{\pi}$, so including those samples breaks the importance-sampling identity.
 Masking by $\zeta_t$ restricts the sum to events where $\hat{\pi}$ truly
 generated the action, restoring unbiasedness.
 
-**Code mapping**: in [`runner.py:519`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py#L519)
-the existing mask construction
+**Code mapping**: now landed in [`runner.insert()`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py).
+`run()` forwards the per-step `step_attack` (a `(n_threads,)` boolean) to `insert()` via
+the data tuple. `insert()` then composes the three masks:
 
 ```python
 adv_active_masks[~self.episode_adversary] = 0
 adv_active_masks[:, np.arange(self.num_agents) != self.agent_adversary] = 0
+adv_active_masks[~step_attack] = 0          # the ζ_t mask
 ```
 
-becomes
-
-```python
-adv_active_masks[~self.episode_adversary] = 0
-adv_active_masks[:, np.arange(self.num_agents) != self.agent_adversary] = 0
-adv_active_masks[~step_attack] = 0          # ← new: the ζ_t mask
-```
+When `attack_prob = 1.0` the third line is a no-op (`step_attack` is all-True), so
+upstream behavior is preserved exactly.
 
 ### 5.7 Modified Eq. (11) — belief BCE loss gains a $\zeta_t$ factor
 
@@ -413,16 +419,29 @@ behavior implies adversary identity," which corrupts the classifier under high
 $1 - p_{\text{attack}}$. Masking by $\zeta_t$ removes uninformative samples and
 restores valid posterior estimation.
 
-**Code mapping**: in [`mappo_advt_with_belief.py:78`](eir_mappo/algo/mappo_advt_with_belief.py#L78):
+**Code mapping** — landed in [`mappo_advt_with_belief.py:update_belief`](eir_mappo/algo/mappo_advt_with_belief.py).
+The implemented form is the *backward-compatible* variant: when `attack_prob = 1.0`
+(`ζ_t ≡ 1`) the masked loss is **bit-equivalent** to the upstream `loss.mean()`. This is
+slightly more elaborate than the cartoon two-liner above because we must compensate the
+denominator by the per-agent dimension to keep loss-per-sample units consistent:
 
 ```python
-loss = nn.functional.binary_cross_entropy(belief, ground_truth_type_batch, reduction='none')
-loss = loss * step_attack_batch.unsqueeze(-1)        # ← new: ζ_t mask
-loss = loss.sum() / (step_attack_batch.sum() + 1e-8)  # ← normalize by fired-step count
+loss_raw = F.binary_cross_entropy(belief, ground_truth_type_batch, reduction='none')
+step_attack_mask = step_attack_batch  # shape (B, 1)
+masked_loss = loss_raw * step_attack_mask
+last_dim = loss_raw.shape[-1]                       # = num_agents
+denom = step_attack_mask.sum() * last_dim           # = numel when ζ_t ≡ 1
+loss = masked_loss.sum() / (denom + 1e-8)
 ```
 
-This requires `actor_buffer_advt_with_belief.py` to record `step_attack` per
-step and return it from the recurrent generators (~20 additional lines).
+When `attack_prob = 1.0` the formula above is numerically identical to the upstream
+`loss.mean()` (since the denominator becomes `numel`), so the legacy code path is
+preserved. At `attack_prob < 1.0` the loss reduces to "average BCE over fired
+(ζ_t = 1) steps", which is what eq. (5.7) prescribes.
+
+`actor_buffer_advt_with_belief.py` now stores `step_attack` per step
+(`(episode_length, n_rollout_threads, 1)`) and `recurrent_generator_belief` returns it
+as the 16th batch field so the algo can multiply it into the BCE loss.
 
 ### 5.8 Backward compatibility
 
@@ -455,10 +474,10 @@ limitation.
 
 | Quantity | Paper location | Modification | Code site |
 |---|---|---|---|
-| Mixed policy | line 1706 | $\theta \to \theta_i \zeta_t$ | `runner.py` action-override (already in this fork) |
+| Mixed policy | line 1706 | $\theta \to \theta_i \zeta_t$ | `runner.py` action-override (landed) |
 | Eq. (8) defender gradient | line 386 | **unchanged** | n/a |
-| Eq. (9) adversary gradient | line 390 | mask by $\zeta_t$ | `runner.py:519` `adv_active_masks` (TODO) |
-| Eq. (11) belief BCE loss | line 423 | multiply by $\zeta_t$ | `mappo_advt_with_belief.py:78` (TODO) |
+| Eq. (9) adversary gradient | line 390 | mask by $\zeta_t$ | `runner.insert()` `adv_active_masks[~step_attack]=0` (landed) |
+| Eq. (11) belief BCE loss | line 423 | multiply by $\zeta_t$ | `mappo_advt_with_belief.update_belief` (landed, bit-equivalent at `attack_prob=1.0`) |
 
 ---
 

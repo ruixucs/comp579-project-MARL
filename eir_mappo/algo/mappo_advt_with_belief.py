@@ -66,6 +66,7 @@ class MAPPOAdvtBelief(MAPPOAdvt):
             old_adv_action_log_probs_batch,
             adv_targ,
             available_actions_batch,
+            step_attack_batch,
         ) = sample
 
         ground_truth_type_batch = check(ground_truth_type_batch).to(**self.tpdv)
@@ -75,13 +76,26 @@ class MAPPOAdvtBelief(MAPPOAdvt):
                                     belief_rnn_states_batch, 
                                     masks_batch)
 
-        loss = nn.functional.binary_cross_entropy(belief, ground_truth_type_batch, reduction='none')
+        loss_raw = nn.functional.binary_cross_entropy(belief, ground_truth_type_batch, reduction='none')
+
+        # COMP579 sec 5.7: zeta_t mask. On steps where step_attack=False the observed action
+        # was drawn from pi_phi regardless of theta, so it is uninformative about identity.
+        # Multiplying the BCE elementwise by step_attack and rescaling the denominator by the
+        # *fired* step count keeps the loss per-sample-equivalent. When attack_prob = 1.0
+        # (legacy upstream behavior) step_attack is all-True and the resulting denominator
+        # equals loss_raw.numel(), reproducing loss.mean() bit-equivalently.
+        step_attack_mask = check(step_attack_batch).to(**self.tpdv)  # (B, 1)
+        # broadcast (B, 1) over the per-agent BCE dim (B, num_agents)
+        last_dim = loss_raw.shape[-1]
+        masked_loss = loss_raw * step_attack_mask
 
         if self.use_belief_active_masks:
             active_masks_batch = check(active_masks_batch).to(**self.tpdv)
-            loss = (loss * active_masks_batch).sum() / active_masks_batch.sum()
+            masked_loss = masked_loss * active_masks_batch
+            denom = (step_attack_mask * active_masks_batch).sum() * last_dim
         else:
-            loss = loss.mean()
+            denom = step_attack_mask.sum() * last_dim
+        loss = masked_loss.sum() / (denom + 1e-8)
 
         self.belief_optimizer.zero_grad()
 
@@ -131,10 +145,14 @@ class MAPPOAdvtBelief(MAPPOAdvt):
                 data_generators.append(data_generator)
 
             for _ in range(self.actor_num_mini_batch):
-                batches = [[] for _ in range(15)]
+                # COMP579 sec 5.7: generator now yields 16 fields, the 16th being
+                # step_attack_batch (zeta_t per (step, thread)). It is a plain ndarray, so
+                # it is concatenated normally; the only "may-be-None" field is index 14
+                # (available_actions_batch), kept as in upstream.
+                batches = [[] for _ in range(16)]
                 for generator in data_generators:
                     sample = next(generator)
-                    for i in range(15):
+                    for i in range(16):
                         batches[i].append(sample[i])
                 for i in range(14):
                     batches[i] = np.concatenate(batches[i], axis=0)
@@ -142,6 +160,7 @@ class MAPPOAdvtBelief(MAPPOAdvt):
                     batches[14] = None
                 else:
                     batches[14] = np.concatenate(batches[14], axis=0)
+                batches[15] = np.concatenate(batches[15], axis=0)
 
                 loss, belief_grad_norm = self.update_belief(tuple(batches))
 
