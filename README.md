@@ -253,19 +253,228 @@ the order C → A → B) for results to support a defensible claim.
 
 ---
 
-## 5. Citation
+## 5. Mathematical derivation — extending the BARDec-POMDP equations to step-level attack
+
+This section grounds the proposed fixes for limitations A and B in the actual
+equations of the original paper, so that the modifications are not ad-hoc but
+follow from re-deriving the policy-gradient and belief-loss expressions under
+the new step-level threat model.
+
+### 5.1 Notation from the original paper
+
+Following Li et al. (ICLR 2024), Section 3.2 and Appendix A.5:
+
+| Symbol | Meaning |
+|---|---|
+| $\theta_i \in \\{0, 1\\}$ | type indicator; $\theta_i = 1$ if agent $i$ is the adversary, $0$ otherwise. **Sampled per episode** by nature. |
+| $\pi_\varphi$ | defender policy (parameters $\varphi$) |
+| $\hat{\pi}_{\hat{\varphi}}$ | adversary policy (parameters $\hat{\varphi}$) |
+| $b^i$ | agent $i$'s belief over types |
+| $Q^i(s, a, b^i)$ | belief-conditioned action-value function |
+| $H^i$ | observation history of agent $i$ |
+| $\rho_\pi(s)$ | state visitation distribution |
+
+### 5.2 Original equations (verbatim from the paper)
+
+**Mixed policy** (paper, Appendix A.5, line 1706):
+
+$$
+\pi_{\varphi, \hat{\varphi}}(a \mid H, b, \theta) \;=\; (1 - \theta) \cdot \pi_\varphi(a \mid H, b) \;+\; \theta \cdot \hat{\pi}_{\hat{\varphi}}(\hat{a} \mid H, \theta)
+$$
+
+**Eq. (8) — defender policy gradient**:
+
+$$
+\nabla_{\varphi^i} J^i(\varphi^i) \;=\; \mathbb{E}_{s \sim \rho_\pi,\, a \sim \pi}\!\left[ (1 - \theta^i)\,\nabla \log \pi_\varphi^i(a^i \mid H^i, b^i)\,Q^i(s, a, b^i) \right]
+$$
+
+**Eq. (9) — adversary policy gradient**:
+
+$$
+\nabla_{\hat{\varphi}^i} J^i(\hat{\varphi}^i) \;=\; \mathbb{E}_{s \sim \rho_\pi,\, a \sim \pi}\!\left[ -\,\theta^i\,\nabla \log \hat{\pi}_{\hat{\varphi}}^i(\hat{a}^i \mid H^i, \theta)\,Q^i(s, a, b^i) \right]
+$$
+
+**Eq. (11) — belief network BCE loss**:
+
+$$
+\min_\xi \;\; -\,\theta\,\log p_\xi(\theta \mid H^i) \;-\; (1 - \theta)\,\log\!\bigl(1 - p_\xi(\theta \mid H^i)\bigr)
+$$
+
+In the original per-episode formulation $\theta_i$ plays three coupled roles
+simultaneously: (i) it determines who the adversary is, (ii) it selects which
+action distribution mixes into the trajectory, and (iii) it acts as a gradient
+mask in (8) and (9). All three coincide because identity is constant within an
+episode.
+
+### 5.3 Adding step-level attack: the new variable $\zeta_t$
+
+We introduce a fresh i.i.d. Bernoulli variable that decides, **at each timestep**,
+whether the adversary actually fires:
+
+$$
+\zeta_t \in \\{0, 1\\}, \qquad \zeta_t \;\sim\; \text{Bernoulli}(p_{\text{attack}}), \qquad \zeta_t \perp\!\!\!\perp \zeta_{t'} \text{ for } t \neq t'.
+$$
+
+The identity variable $\theta_i$ keeps its original meaning (per-episode). What
+changes is that the **effective adversarial-action mask** at timestep $t$ is now
+the product
+
+$$
+\theta_i \cdot \zeta_t \;=\; \begin{cases} 1 & \text{agent } i \text{ is the adversary } \mathbf{and} \text{ it fires at step } t, \\\\ 0 & \text{otherwise.}\end{cases}
+$$
+
+This is exactly the boolean mask `attack_mask = self.episode_adversary & step_attack`
+in [`runner.py`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py).
+
+### 5.4 Modified mixed policy
+
+The action-distribution mixture becomes:
+
+$$
+\boxed{\;\pi_{\varphi, \hat{\varphi}}(a \mid H, b, \theta, \zeta_t) \;=\; (1 - \theta_i \zeta_t)\,\pi_\varphi(a \mid H, b) \;+\; \theta_i \zeta_t\,\hat{\pi}_{\hat{\varphi}}(\hat{a} \mid H, \theta)\;}
+$$
+
+This is the per-step generalization of paper line 1706 with $\theta \mapsto \theta_i \zeta_t$.
+
+### 5.5 Modified Eq. (8) — defender gradient is **unchanged**
+
+$$
+\nabla_{\varphi^i} J^i(\varphi^i) \;=\; \mathbb{E}\!\left[ (1 - \theta^i)\,\nabla \log \pi_\varphi^i(a^i \mid H^i, b^i)\,Q^i(s, a, b^i) \right]
+$$
+
+The mask remains $(1 - \theta^i)$. Reasoning:
+
+- If $\theta^i = 0$ (agent is a defender) — the defender always acts via $\pi_\varphi$, every timestep, regardless of $\zeta_t$. So gradient updates apply to all steps.
+- If $\theta^i = 1$ (agent is the adversary) — we never want to update its defender head, regardless of $\zeta_t$.
+
+So the mask depends only on identity, not on $\zeta_t$. **No code change needed
+for the defender side.**
+
+### 5.6 Modified Eq. (9) — adversary gradient gains a $\zeta_t$ factor
+
+$$
+\boxed{\;\nabla_{\hat{\varphi}^i} J^i(\hat{\varphi}^i) \;=\; \mathbb{E}\!\left[ -\,\theta^i\,\zeta_t\,\nabla \log \hat{\pi}_{\hat{\varphi}}^i(\hat{a}^i \mid H^i, \theta)\,Q^i(s, a, b^i) \right]\;}
+$$
+
+**Derivation sketch** (mirrors the paper's Appendix A.5, lines 1697–1769, with
+$\theta \mapsto \theta_i \zeta_t$ in the mixture):
+
+$$
+\nabla_{\hat{\varphi}^i}\!\sum_{a \in A}\!\bigl[(1 - \theta_i \zeta_t)\pi_\varphi(a) + \theta_i \zeta_t\,\hat{\pi}_{\hat{\varphi}}(\hat{a})\bigr] Q^i(s, a, b^i)
+\;=\; \sum_{a \in A} \theta_i \zeta_t \,\nabla_{\hat{\varphi}^i}\hat{\pi}_{\hat{\varphi}}(\hat{a})\,Q^i + (\text{recursive term})
+$$
+
+The first $(1 - \theta_i \zeta_t)\pi_\varphi$ term has zero gradient with respect to
+$\hat{\varphi}^i$. Following the same log-derivative trick as in the paper
+(line 1758), this becomes an expectation under $\rho_\pi$ with score function
+$\nabla \log \hat{\pi}$ multiplied by $\theta_i \zeta_t$.
+
+**Why this is the *correct* fix and not just a heuristic**: the policy-gradient
+estimator is unbiased only when $a$ is actually drawn from $\hat{\pi}$. When
+$\zeta_t = 0$ the realized action $a$ comes from $\pi_\varphi$, not from
+$\hat{\pi}$, so including those samples breaks the importance-sampling identity.
+Masking by $\zeta_t$ restricts the sum to events where $\hat{\pi}$ truly
+generated the action, restoring unbiasedness.
+
+**Code mapping**: in [`runner.py:519`](eir_mappo/runner/on_policy_ma_runner_advt_with_belief.py#L519)
+the existing mask construction
+
+```python
+adv_active_masks[~self.episode_adversary] = 0
+adv_active_masks[:, np.arange(self.num_agents) != self.agent_adversary] = 0
+```
+
+becomes
+
+```python
+adv_active_masks[~self.episode_adversary] = 0
+adv_active_masks[:, np.arange(self.num_agents) != self.agent_adversary] = 0
+adv_active_masks[~step_attack] = 0          # ← new: the ζ_t mask
+```
+
+### 5.7 Modified Eq. (11) — belief BCE loss gains a $\zeta_t$ factor
+
+$$
+\boxed{\;\min_\xi \;\; \zeta_t \cdot \Bigl[\,-\,\theta\,\log p_\xi(\theta \mid H^i) \;-\; (1 - \theta)\,\log\!\bigl(1 - p_\xi(\theta \mid H^i)\bigr)\Bigr]\;}
+$$
+
+**Why**: the BCE objective treats observations $H^i$ as samples from a
+type-conditional distribution $p(H^i \mid \theta)$. But on a step where
+$\zeta_t = 0$, the action visible in $H^i$ is drawn from $\pi_\varphi$
+**regardless of $\theta$**, so
+
+$$
+p(\text{observed action} \mid \theta_i = 1, \zeta_t = 0) \;=\; p(\text{observed action} \mid \theta_i = 0) \;=\; \pi_\varphi(a)
+$$
+
+The likelihood ratio is $1$ — the observation is *uninformative* about $\theta$.
+Including it in the BCE loss is equivalent to teaching the network that "normal
+behavior implies adversary identity," which corrupts the classifier under high
+$1 - p_{\text{attack}}$. Masking by $\zeta_t$ removes uninformative samples and
+restores valid posterior estimation.
+
+**Code mapping**: in [`mappo_advt_with_belief.py:78`](eir_mappo/algo/mappo_advt_with_belief.py#L78):
+
+```python
+loss = nn.functional.binary_cross_entropy(belief, ground_truth_type_batch, reduction='none')
+loss = loss * step_attack_batch.unsqueeze(-1)        # ← new: ζ_t mask
+loss = loss.sum() / (step_attack_batch.sum() + 1e-8)  # ← normalize by fired-step count
+```
+
+This requires `actor_buffer_advt_with_belief.py` to record `step_attack` per
+step and return it from the recurrent generators (~20 additional lines).
+
+### 5.8 Backward compatibility
+
+When $p_{\text{attack}} = 1$ we have $\zeta_t \equiv 1$ and every modified
+equation reduces to its original form:
+
+| Modified | $\zeta_t \equiv 1$ reduction | Original |
+|---|---|---|
+| $\theta_i \zeta_t$ | $\theta_i$ | original $\theta_i$ |
+| $(1 - \theta_i \zeta_t)\pi_\varphi + \theta_i \zeta_t \hat{\pi}$ | $(1 - \theta_i)\pi_\varphi + \theta_i \hat{\pi}$ | line 1706 |
+| Eq. (9) with $\zeta_t$ mask | Eq. (9) original | Eq. (9) |
+| Eq. (11) with $\zeta_t$ mask | Eq. (11) original | Eq. (11) |
+
+So the code path with `attack_prob = 1.0` is bit-equivalent to the upstream
+EIR-MAPPO algorithm.
+
+### 5.9 Caveat on convergence
+
+The original paper's Theorem 3.1 (almost-sure convergence to an ex-interim
+RMPBE) is stated for the per-episode formulation. Strictly speaking the
+$\zeta_t$-masked variant requires a separate convergence argument. Intuitively,
+masking by an i.i.d. Bernoulli does not break the stochastic-approximation
+conditions used in the paper's proof (Borkar 1997, 2009): the masked gradients
+still form an unbiased estimator with bounded variance, only the effective
+sample rate per parameter update is reduced from $1$ to $p_{\text{attack}}$.
+A formal extension of the proof is left to future work and acknowledged as a
+limitation.
+
+### 5.10 Summary table — equations to code
+
+| Quantity | Paper location | Modification | Code site |
+|---|---|---|---|
+| Mixed policy | line 1706 | $\theta \to \theta_i \zeta_t$ | `runner.py` action-override (already in this fork) |
+| Eq. (8) defender gradient | line 386 | **unchanged** | n/a |
+| Eq. (9) adversary gradient | line 390 | mask by $\zeta_t$ | `runner.py:519` `adv_active_masks` (TODO) |
+| Eq. (11) belief BCE loss | line 423 | multiply by $\zeta_t$ | `mappo_advt_with_belief.py:78` (TODO) |
+
+---
+
+## 6. Citation
 
 If you use this code, please cite the original EIR-MAPPO paper:
 
-```
-@inproceedings{yuan2024byzantine,
-  title={Byzantine Robust Cooperative Multi-Agent Reinforcement Learning as a Bayesian Game},
-  author={Yuan, Yi and Zhang, Yunbo and ...},
-  booktitle={ICLR},
-  year={2024}
+```bibtex
+@inproceedings{li2024byzantine,
+  title     = {Byzantine Robust Cooperative Multi-Agent Reinforcement Learning as a {B}ayesian Game},
+  author    = {Li, Simin and Guo, Jun and Xiu, Jingqiao and Xu, Ruixiao and Yu, Xin and Wang, Jiakai and Liu, Aishan and Yang, Yaodong and Liu, Xianglong},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024}
 }
 ```
 
-## 6. License
+## 7. License
 
 Inherits the upstream EIR-MAPPO license.
